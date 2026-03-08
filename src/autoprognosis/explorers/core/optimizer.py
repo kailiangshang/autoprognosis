@@ -10,6 +10,30 @@ from autoprognosis.explorers.core.optimizers.hyperband import HyperbandOptimizer
 
 
 class Optimizer:
+    """Wrapper for hyperparameter optimization backends.
+
+    Delegates to the chosen backend for hyperparameter search:
+        - "bayesian": Optuna-based TPE (Tree-structured Parzen Estimator) optimization.
+        - "hyperband": Hyperband successive halving algorithm (via Optuna).
+
+    Args:
+        study_name: str
+            Unique study identifier, used as the Optuna study name.
+        estimator: Any
+            The estimator whose hyperparameters are being optimized.
+        evaluation_cbk: Callable
+            Callback that evaluates hyperparameters and returns a score.
+        optimizer_type: str
+            "bayesian" or "hyperband".
+        n_trials: int
+            Maximum number of Optuna trials (bayesian) or configurations (hyperband).
+        timeout: int
+            Maximum seconds for the search.
+        eta: int
+            Hyperband downsampling rate (only used when optimizer_type="hyperband").
+        random_state: int
+            Random seed for reproducibility.
+    """
     def __init__(
         self,
         study_name: str,
@@ -51,6 +75,33 @@ class Optimizer:
 
 
 class EnsembleOptimizer:
+    """Wrapper for ensemble weight optimization backends.
+
+    Optimizes the blending weights of an ensemble of models using Optuna.
+    Supports the same backends as Optimizer ("bayesian" / "hyperband").
+
+    Args:
+        study_name: str
+            Unique study identifier for the Optuna study.
+        ensemble_len: int
+            Number of base models in the ensemble.
+        evaluation_cbk: Callable
+            Callback that takes a weight vector and returns a score.
+        optimizer_type: str
+            "bayesian" or "hyperband".
+        n_trials: int
+            Maximum number of Optuna trials.
+        timeout: int
+            Maximum seconds for the search.
+        max_iter: int
+            Hyperband max iterations per configuration.
+        eta: int
+            Hyperband downsampling rate.
+        skip_recap: bool
+            If True, skip enqueuing initial one-hot weight trials.
+        random_state: int
+            Random seed for reproducibility.
+    """
     def __init__(
         self,
         study_name: str,
