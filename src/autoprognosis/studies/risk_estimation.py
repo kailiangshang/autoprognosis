@@ -1,37 +1,23 @@
 # stdlib
-import time
 from pathlib import Path
-from typing import Any, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple
 
 # third party
 import numpy as np
 import pandas as pd
 
-import autoprognosis.logger as log
-
 # autoprognosis absolute
-from autoprognosis.exceptions import StudyCancelled
 from autoprognosis.explorers.core.defaults import (
     default_feature_scaling_names,
     default_feature_selection_names,
     default_risk_estimation_names,
 )
-from autoprognosis.explorers.risk_estimation_combos import (
-    RiskEnsembleSeeker as standard_seeker,
-)
+from autoprognosis.explorers.risk_estimation_combos import RiskEnsembleSeeker
 from autoprognosis.hooks import DefaultHooks, Hooks
-from autoprognosis.report import StudyReport
-from autoprognosis.studies._base import Study
+from autoprognosis.studies._base import PATIENCE, SCORE_THRESHOLD, Study
 from autoprognosis.utils.distributions import enable_reproducible_results
-from autoprognosis.utils.serialization import (
-    dataframe_hash,
-    load_model_from_file,
-    save_model_to_file,
-)
+from autoprognosis.utils.serialization import dataframe_hash
 from autoprognosis.utils.tester import evaluate_survival_estimator
-
-PATIENCE = 10
-SCORE_THRESHOLD = 0.65
 
 
 class RiskEstimationStudy(Study):
@@ -168,10 +154,8 @@ class RiskEstimationStudy(Study):
         ensemble_size: int = 3,
         n_folds_cv: int = 5,
     ) -> None:
-        super().__init__()
         enable_reproducible_results(random_state)
 
-        # If only one imputation method is provided, we don't feed it into the optimizer
         if nan_placeholder is not None:
             dataset = dataset.replace(nan_placeholder, np.nan)
 
@@ -182,7 +166,6 @@ class RiskEstimationStudy(Study):
             imputers = []
 
         self.time_horizons = time_horizons
-        self.score_threshold = score_threshold
 
         drop_cols = [target, time_to_event]
         self.group_ids = None
@@ -213,29 +196,13 @@ class RiskEstimationStudy(Study):
             self.search_T = self.T
             self.search_group_ids = self.group_ids
 
-        self.internal_name = dataframe_hash(dataset)
-        self.study_name = study_name if study_name is not None else self.internal_name
+        internal_name = dataframe_hash(dataset)
+        resolved_name = study_name if study_name is not None else internal_name
 
-        self.output_folder = Path(workspace).resolve() / self.study_name
-        self.output_folder.mkdir(parents=True, exist_ok=True)
-
-        self.output_file = self.output_folder / "model.p"
-
-        log.info(f"Study '{self.study_name}' workspace: {self.output_folder}")
-
-        self.num_iter = num_iter
-        self.num_study_iter = num_study_iter
-        self.hooks = hooks
         self.random_state = random_state
         self.n_folds_cv = n_folds_cv
 
-        # Report tracking state
-        self._search_history: list = []
-        self._start_time: float = 0
-        self._end_time: float = 0
-        self._best_metrics: dict = {}
-        self._best_metrics_raw: dict = {}
-        self._study_config = {
+        study_config = {
             "num_iter": num_iter,
             "num_study_iter": num_study_iter,
             "num_ensemble_iter": num_ensemble_iter,
@@ -253,8 +220,18 @@ class RiskEstimationStudy(Study):
             "time_horizons": [float(h) for h in time_horizons],
         }
 
-        self.standard_seeker = standard_seeker(
-            self.internal_name,
+        super().__init__(
+            study_name=resolved_name,
+            output_folder=Path(workspace).resolve() / resolved_name,
+            score_threshold=score_threshold,
+            num_study_iter=num_study_iter,
+            metric="c_index - brier_score",
+            hooks=hooks,
+            study_config=study_config,
+        )
+
+        self.seeker = RiskEnsembleSeeker(
+            internal_name,
             time_horizons,
             num_iter=num_iter,
             num_ensemble_iter=num_ensemble_iter,
@@ -264,214 +241,39 @@ class RiskEstimationStudy(Study):
             feature_selection=feature_selection,
             imputers=imputers,
             hooks=hooks,
-            random_state=self.random_state,
+            random_state=random_state,
             n_folds_cv=n_folds_cv,
         )
+        self._last_iteration = 0
 
-    def _should_continue(self) -> None:
-        if self.hooks.cancel():
-            raise StudyCancelled("Risk estimation study search cancelled")
-
-    def _load_progress(self) -> Tuple[int, Any]:
-        self._should_continue()
-
-        if not self.output_file.is_file():
-            return -1, None
-
-        try:
-            log.info("evaluate previous model")
-            start = time.time()
-            best_model = load_model_from_file(self.output_file)
-            metrics = evaluate_survival_estimator(
-                best_model,
-                self.search_X,
-                self.search_T,
-                self.search_Y,
-                self.time_horizons,
-                group_ids=self.search_group_ids,
-                n_folds=self.n_folds_cv,
-            )
-            best_score = metrics["raw"]["c_index"][0] - metrics["raw"]["brier_score"][0]
-            eval_metrics = {}
-            for metric in metrics["raw"]:
-                eval_metrics[metric] = metrics["raw"][metric][0]
-                eval_metrics[f"{metric}_str"] = metrics["str"][metric]
-
-            self.hooks.heartbeat(
-                topic="risk_estimation_study",
-                subtopic="candidate",
-                event_type="candidate",
-                name=best_model.name(),
-                duration=time.time() - start,
-                score=best_score,
-                **eval_metrics,
-            )
-            log.info(f"Previous best score {best_score}")
-            return best_score, best_model
-        except BaseException as e:
-            log.error(f"failed to load previous model {e}")
-            return -1, None
-
-    def _save_progress(self, model: Any) -> None:
-        self._should_continue()
-
-        if self.output_file:
-            save_model_to_file(self.output_file, model)
-
-    def run(self) -> Any:
-        """Run the study. The call returns the optimal model architecture - not fitted."""
-        self._should_continue()
-        self._start_time = time.time()
-        self._search_history = []
-
-        best_score, best_model = self._load_progress()
-
-        seekers: List[Union[standard_seeker]] = [
-            self.standard_seeker,
-        ]
-        not_improved = 0
-
-        for it in range(self.num_study_iter):
-            for seeker in seekers:
-                self._should_continue()
-                start = time.time()
-
-                current_model = seeker.search(
-                    self.search_X,
-                    self.search_T,
-                    self.search_Y,
-                    skip_recap=(it > 0),
-                    group_ids=self.search_group_ids,
-                )
-
-                metrics = evaluate_survival_estimator(
-                    current_model,
-                    self.search_X,
-                    self.search_T,
-                    self.search_Y,
-                    self.time_horizons,
-                    group_ids=self.search_group_ids,
-                    n_folds=self.n_folds_cv,
-                )
-                score = metrics["raw"]["c_index"][0] - metrics["raw"]["brier_score"][0]
-                eval_metrics = {}
-                for metric in metrics["raw"]:
-                    eval_metrics[metric] = metrics["raw"][metric][0]
-                    eval_metrics[f"{metric}_str"] = metrics["str"][metric]
-
-                self.hooks.heartbeat(
-                    topic="risk_estimation_study",
-                    subtopic="candidate",
-                    event_type="candidate",
-                    name=current_model.name(),
-                    duration=time.time() - start,
-                    score=best_score,
-                    **eval_metrics,
-                )
-
-                iter_duration = time.time() - start
-                is_best = False
-
-                if score < self.score_threshold:
-                    log.info(
-                        f"The ensemble is not good enough, keep searching {metrics}"
-                    )
-                    self._search_history.append({
-                        "iteration": it + 1,
-                        "model_name": current_model.name(),
-                        "score": score,
-                        "duration": iter_duration,
-                        "is_best": False,
-                    })
-                    continue
-
-                if best_score >= score:
-                    log.info(
-                        f"Model score not improved {score}. Previous best {best_score}"
-                    )
-                    not_improved += 1
-                    self._search_history.append({
-                        "iteration": it + 1,
-                        "model_name": current_model.name(),
-                        "score": score,
-                        "duration": iter_duration,
-                        "is_best": False,
-                    })
-                    continue
-
-                not_improved = 0
-                best_score = score
-                best_model = current_model
-                is_best = True
-
-                self._best_metrics = {m: metrics["str"][m] for m in metrics["str"]}
-                self._best_metrics_raw = {m: metrics["raw"][m] for m in metrics["raw"]}
-
-                log.info(
-                    f"Best ensemble so far: {best_model.name()} with score {score}"
-                )
-
-                self._search_history.append({
-                    "iteration": it + 1,
-                    "model_name": current_model.name(),
-                    "score": score,
-                    "duration": iter_duration,
-                    "is_best": is_best,
-                })
-
-                self._save_progress(best_model)
-
-            if not_improved > PATIENCE:
-                log.info(f"Study not improved for {PATIENCE} iterations. Stopping...")
-                break
-
-        self._end_time = time.time()
-        self.hooks.finish()
-        if best_score < self.score_threshold:
-            log.warning(
-                f"Unable to find a model above threshold {self.score_threshold}. Returning None"
-            )
-            self._best_score = best_score
-            self._best_model_name = None
-            return None
-
-        self._best_score = best_score
-        self._best_model_name = best_model.name()
-        return best_model
-
-    def fit(self) -> Any:
-        """Run the study and train the model. The call returns the fitted model."""
-        model = self.run()
-        if model is not None:
-            model.fit(self.X, self.T, self.Y)
-
-        return model
-
-    def report(self) -> StudyReport:
-        """Generate a study report. Call after fit() or run().
-
-        Prints a console summary and saves an HTML report to the workspace.
-
-        Returns:
-            StudyReport with all study results and metadata.
-        """
-        success = hasattr(self, "_best_score") and self._best_score >= self.score_threshold
-
-        rpt = StudyReport(
-            study_name=self.study_name,
-            task_type="risk_estimation",
-            metric="c_index - brier_score",
-            best_score=getattr(self, "_best_score", -1),
-            best_model_name=getattr(self, "_best_model_name", None),
-            best_metrics=self._best_metrics,
-            best_metrics_raw=self._best_metrics_raw,
-            search_history=self._search_history,
-            study_config=self._study_config,
-            workspace=str(self.output_folder),
-            total_duration_seconds=self._end_time - self._start_time if self._end_time else 0,
-            success=success,
+    def _search(self, iteration: int) -> Any:
+        self._last_iteration = iteration
+        return self.seeker.search(
+            self.search_X,
+            self.search_T,
+            self.search_Y,
+            skip_recap=(iteration > 0),
+            group_ids=self.search_group_ids,
         )
 
-        print(rpt.to_console())
-        rpt.save()
-        return rpt
+    def _evaluate(self, model: Any) -> Tuple[float, Dict]:
+        metrics = evaluate_survival_estimator(
+            model,
+            self.search_X,
+            self.search_T,
+            self.search_Y,
+            self.time_horizons,
+            group_ids=self.search_group_ids,
+            n_folds=self.n_folds_cv,
+        )
+        score = metrics["raw"]["c_index"][0] - metrics["raw"]["brier_score"][0]
+        return score, metrics
+
+    def _fit_model(self, model: Any) -> None:
+        model.fit(self.X, self.T, self.Y)
+
+    def _get_task_type(self) -> str:
+        return "risk_estimation"
+
+    def _get_heartbeat_topic(self) -> str:
+        return "risk_estimation_study"

@@ -1,16 +1,12 @@
 # stdlib
-import time
 from pathlib import Path
-from typing import Any, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 # third party
 import numpy as np
 import pandas as pd
 
-import autoprognosis.logger as log
-
 # autoprognosis absolute
-from autoprognosis.exceptions import StudyCancelled
 from autoprognosis.explorers.core.defaults import (
     default_feature_scaling_names,
     default_feature_selection_names,
@@ -18,18 +14,10 @@ from autoprognosis.explorers.core.defaults import (
 )
 from autoprognosis.explorers.regression_combos import RegressionEnsembleSeeker
 from autoprognosis.hooks import DefaultHooks, Hooks
-from autoprognosis.report import StudyReport
-from autoprognosis.studies._base import Study
+from autoprognosis.studies._base import PATIENCE, SCORE_THRESHOLD, Study
 from autoprognosis.utils.distributions import enable_reproducible_results
-from autoprognosis.utils.serialization import (
-    dataframe_hash,
-    load_model_from_file,
-    save_model_to_file,
-)
+from autoprognosis.utils.serialization import dataframe_hash
 from autoprognosis.utils.tester import evaluate_regression
-
-PATIENCE = 10
-SCORE_THRESHOLD = 0.65
 
 
 class RegressionStudy(Study):
@@ -174,10 +162,8 @@ class RegressionStudy(Study):
         ensemble_size: int = 3,
         n_folds_cv: int = 5,
     ) -> None:
-        super().__init__()
         enable_reproducible_results(random_state)
 
-        self.hooks = hooks
         dataset = pd.DataFrame(dataset)
         if nan_placeholder is not None:
             dataset = dataset.replace(nan_placeholder, np.nan)
@@ -211,29 +197,12 @@ class RegressionStudy(Study):
             self.search_Y = self.Y
             self.search_group_ids = self.group_ids
 
-        self.internal_name = dataframe_hash(dataset)
-        self.study_name = study_name if study_name is not None else self.internal_name
+        internal_name = dataframe_hash(dataset)
+        resolved_name = study_name if study_name is not None else internal_name
 
-        self.output_folder = Path(workspace).resolve() / self.study_name
-        self.output_folder.mkdir(parents=True, exist_ok=True)
-
-        self.output_file = self.output_folder / "model.p"
-
-        log.info(f"Study '{self.study_name}' workspace: {self.output_folder}")
-
-        self.num_study_iter = num_study_iter
-
-        self.metric = metric
-        self.score_threshold = score_threshold
         self.random_state = random_state
 
-        # Report tracking state
-        self._search_history: list = []
-        self._start_time: float = 0
-        self._end_time: float = 0
-        self._best_metrics: dict = {}
-        self._best_metrics_raw: dict = {}
-        self._study_config = {
+        study_config = {
             "num_iter": num_iter,
             "num_study_iter": num_study_iter,
             "num_ensemble_iter": num_ensemble_iter,
@@ -251,8 +220,18 @@ class RegressionStudy(Study):
             "n_folds_cv": n_folds_cv,
         }
 
+        super().__init__(
+            study_name=resolved_name,
+            output_folder=Path(workspace).resolve() / resolved_name,
+            score_threshold=score_threshold,
+            num_study_iter=num_study_iter,
+            metric=metric,
+            hooks=hooks,
+            study_config=study_config,
+        )
+
         self.seeker = RegressionEnsembleSeeker(
-            self.internal_name,
+            internal_name,
             num_iter=num_iter,
             num_ensemble_iter=num_ensemble_iter,
             timeout=timeout,
@@ -261,204 +240,33 @@ class RegressionStudy(Study):
             feature_selection=feature_selection,
             regressors=regressors,
             imputers=imputers,
-            hooks=self.hooks,
-            random_state=self.random_state,
+            hooks=hooks,
+            random_state=random_state,
             n_folds_cv=n_folds_cv,
             ensemble_size=ensemble_size,
         )
 
-    def _should_continue(self) -> None:
-        if self.hooks.cancel():
-            raise StudyCancelled("Regression study search cancelled")
-
-    def _load_progress(self) -> Tuple[int, Any]:
-        self._should_continue()
-
-        if not self.output_file.is_file():
-            return -1, None
-
-        try:
-            start = time.time()
-            best_model = load_model_from_file(self.output_file)
-            metrics = evaluate_regression(
-                best_model,
-                self.search_X,
-                self.search_Y,
-                group_ids=self.search_group_ids,
-                n_folds=self.n_folds_cv,
-            )
-            best_score = metrics["raw"][self.metric][0]
-            eval_metrics = {}
-            for metric in metrics["raw"]:
-                eval_metrics[metric] = metrics["raw"][metric][0]
-                eval_metrics[f"{metric}_str"] = metrics["str"][metric]
-
-            self.hooks.heartbeat(
-                topic="regression_study",
-                subtopic="candidate",
-                event_type="candidate",
-                name=best_model.name(),
-                duration=time.time() - start,
-                score=best_score,
-                **eval_metrics,
-            )
-
-            return best_score, best_model
-        except BaseException:
-            return -1, None
-
-    def _save_progress(self, model: Any) -> None:
-        self._should_continue()
-
-        if self.output_file:
-            save_model_to_file(self.output_file, model)
-
-    def run(self) -> Any:
-        """Run the study. The call returns the optimal model architecture - not fitted."""
-        self._should_continue()
-        self._start_time = time.time()
-        self._search_history = []
-
-        best_score, best_model = self._load_progress()
-
-        patience = 0
-        for it in range(self.num_study_iter):
-            self._should_continue()
-            start = time.time()
-
-            current_model = self.seeker.search(
-                self.search_X, self.search_Y, group_ids=self.search_group_ids
-            )
-
-            metrics = evaluate_regression(
-                current_model,
-                self.search_X,
-                self.search_Y,
-                group_ids=self.search_group_ids,
-                n_folds=self.n_folds_cv,
-            )
-            score = metrics["raw"][self.metric][0]
-            eval_metrics = {}
-            for metric in metrics["raw"]:
-                eval_metrics[metric] = metrics["raw"][metric][0]
-                eval_metrics[f"{metric}_str"] = metrics["str"][metric]
-
-            self.hooks.heartbeat(
-                topic="regression_study",
-                subtopic="candidate",
-                event_type="candidate",
-                name=current_model.name(),
-                duration=time.time() - start,
-                score=score,
-                **eval_metrics,
-            )
-
-            iter_duration = time.time() - start
-            is_best = False
-
-            if score < self.score_threshold:
-                log.info(
-                    f"The ensemble is not good enough, keep searching {metrics['str']}"
-                )
-                self._search_history.append({
-                    "iteration": it + 1,
-                    "model_name": current_model.name(),
-                    "score": score,
-                    "duration": iter_duration,
-                    "is_best": False,
-                })
-                continue
-
-            if best_score >= score:
-                log.info(
-                    f"Model score not improved {score}. Previous best {best_score}"
-                )
-                patience += 1
-                self._search_history.append({
-                    "iteration": it + 1,
-                    "model_name": current_model.name(),
-                    "score": score,
-                    "duration": iter_duration,
-                    "is_best": False,
-                })
-
-                if patience > PATIENCE:
-                    log.info(
-                        f"Study not improved for {PATIENCE} iterations. Stopping..."
-                    )
-                    break
-                continue
-
-            patience = 0
-            best_score = metrics["raw"][self.metric][0]
-            best_model = current_model
-            is_best = True
-
-            self._best_metrics = {m: metrics["str"][m] for m in metrics["str"]}
-            self._best_metrics_raw = {m: metrics["raw"][m] for m in metrics["raw"]}
-
-            log.info(
-                f"Best ensemble so far: {best_model.name()} with score {metrics['raw'][self.metric]}"
-            )
-
-            self._search_history.append({
-                "iteration": it + 1,
-                "model_name": current_model.name(),
-                "score": score,
-                "duration": iter_duration,
-                "is_best": is_best,
-            })
-
-            self._save_progress(best_model)
-
-        self._end_time = time.time()
-        self.hooks.finish()
-
-        if best_score < self.score_threshold:
-            log.warning(
-                f"Unable to find a model above threshold {self.score_threshold}. Returning None"
-            )
-            self._best_score = best_score
-            self._best_model_name = None
-            return None
-
-        self._best_score = best_score
-        self._best_model_name = best_model.name()
-        return best_model
-
-    def fit(self) -> Any:
-        """Run the study and train the model. The call returns the fitted model."""
-        model = self.run()
-        if model is not None:
-            model.fit(self.X, self.Y)
-
-        return model
-
-    def report(self) -> StudyReport:
-        """Generate a study report. Call after fit() or run().
-
-        Prints a console summary and saves an HTML report to the workspace.
-
-        Returns:
-            StudyReport with all study results and metadata.
-        """
-        success = hasattr(self, "_best_score") and self._best_score >= self.score_threshold
-
-        rpt = StudyReport(
-            study_name=self.study_name,
-            task_type="regression",
-            metric=self.metric,
-            best_score=getattr(self, "_best_score", -1),
-            best_model_name=getattr(self, "_best_model_name", None),
-            best_metrics=self._best_metrics,
-            best_metrics_raw=self._best_metrics_raw,
-            search_history=self._search_history,
-            study_config=self._study_config,
-            workspace=str(self.output_folder),
-            total_duration_seconds=self._end_time - self._start_time if self._end_time else 0,
-            success=success,
+    def _search(self, iteration: int) -> Any:
+        return self.seeker.search(
+            self.search_X, self.search_Y, group_ids=self.search_group_ids
         )
 
-        print(rpt.to_console())
-        rpt.save()
-        return rpt
+    def _evaluate(self, model: Any) -> Tuple[float, Dict]:
+        metrics = evaluate_regression(
+            model,
+            self.search_X,
+            self.search_Y,
+            group_ids=self.search_group_ids,
+            n_folds=self.n_folds_cv,
+        )
+        score = metrics["raw"][self.metric][0]
+        return score, metrics
+
+    def _fit_model(self, model: Any) -> None:
+        model.fit(self.X, self.Y)
+
+    def _get_task_type(self) -> str:
+        return "regression"
+
+    def _get_heartbeat_topic(self) -> str:
+        return "regression_study"
