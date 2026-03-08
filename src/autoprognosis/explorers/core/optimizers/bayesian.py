@@ -158,7 +158,7 @@ class BayesianOptimizer:
             try:
                 backend = RedisBackend()
                 storage_obj = backend.optuna()
-            except BaseException:
+            except Exception:
                 storage_obj = None
 
         sampler = optuna.samplers.TPESampler(seed=self.random_state)
@@ -170,7 +170,7 @@ class BayesianOptimizer:
                 load_if_exists=load_if_exists,
                 sampler=sampler,
             )
-        except BaseException as e:
+        except Exception as e:
             log.debug(f"create_study failed {e}")
             study = optuna.create_study(
                 direction=direction,
