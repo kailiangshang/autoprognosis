@@ -213,10 +213,12 @@ class RegressionStudy(Study):
         self.internal_name = dataframe_hash(dataset)
         self.study_name = study_name if study_name is not None else self.internal_name
 
-        self.output_folder = Path(workspace) / self.study_name
+        self.output_folder = Path(workspace).resolve() / self.study_name
         self.output_folder.mkdir(parents=True, exist_ok=True)
 
         self.output_file = self.output_folder / "model.p"
+
+        log.info(f"Study '{self.study_name}' workspace: {self.output_folder}")
 
         self.num_study_iter = num_study_iter
 
@@ -325,7 +327,7 @@ class RegressionStudy(Study):
             )
 
             if score < self.score_threshold:
-                log.critical(
+                log.info(
                     f"The ensemble is not good enough, keep searching {metrics['str']}"
                 )
                 continue
@@ -347,7 +349,7 @@ class RegressionStudy(Study):
             best_score = metrics["raw"][self.metric][0]
             best_model = current_model
 
-            log.error(
+            log.info(
                 f"Best ensemble so far: {best_model.name()} with score {metrics['raw'][self.metric]}"
             )
 
@@ -356,7 +358,7 @@ class RegressionStudy(Study):
         self.hooks.finish()
 
         if best_score < self.score_threshold:
-            log.critical(
+            log.warning(
                 f"Unable to find a model above threshold {self.score_threshold}. Returning None"
             )
             return None

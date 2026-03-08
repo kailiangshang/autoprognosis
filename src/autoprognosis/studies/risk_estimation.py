@@ -215,10 +215,12 @@ class RiskEstimationStudy(Study):
         self.internal_name = dataframe_hash(dataset)
         self.study_name = study_name if study_name is not None else self.internal_name
 
-        self.output_folder = Path(workspace) / self.study_name
+        self.output_folder = Path(workspace).resolve() / self.study_name
         self.output_folder.mkdir(parents=True, exist_ok=True)
 
         self.output_file = self.output_folder / "model.p"
+
+        log.info(f"Study '{self.study_name}' workspace: {self.output_folder}")
 
         self.num_iter = num_iter
         self.num_study_iter = num_study_iter
@@ -279,7 +281,7 @@ class RiskEstimationStudy(Study):
                 score=best_score,
                 **eval_metrics,
             )
-            log.error(f"Previous best score {best_score}")
+            log.info(f"Previous best score {best_score}")
             return best_score, best_model
         except BaseException as e:
             log.error(f"failed to load previous model {e}")
@@ -357,7 +359,7 @@ class RiskEstimationStudy(Study):
                 best_score = score
                 best_model = current_model
 
-                log.error(
+                log.info(
                     f"Best ensemble so far: {best_model.name()} with score {score}"
                 )
 
@@ -369,7 +371,7 @@ class RiskEstimationStudy(Study):
 
         self.hooks.finish()
         if best_score < self.score_threshold:
-            log.critical(
+            log.warning(
                 f"Unable to find a model above threshold {self.score_threshold}. Returning None"
             )
             return None
