@@ -18,6 +18,7 @@ from autoprognosis.explorers.core.defaults import (
 )
 from autoprognosis.explorers.regression_combos import RegressionEnsembleSeeker
 from autoprognosis.hooks import DefaultHooks, Hooks
+from autoprognosis.report import StudyReport
 from autoprognosis.studies._base import Study
 from autoprognosis.utils.distributions import enable_reproducible_results
 from autoprognosis.utils.serialization import (
@@ -226,6 +227,30 @@ class RegressionStudy(Study):
         self.score_threshold = score_threshold
         self.random_state = random_state
 
+        # Report tracking state
+        self._search_history: list = []
+        self._start_time: float = 0
+        self._end_time: float = 0
+        self._best_metrics: dict = {}
+        self._best_metrics_raw: dict = {}
+        self._study_config = {
+            "num_iter": num_iter,
+            "num_study_iter": num_study_iter,
+            "num_ensemble_iter": num_ensemble_iter,
+            "timeout": timeout,
+            "metric": metric,
+            "regressors": regressors,
+            "feature_scaling": feature_scaling,
+            "feature_selection": feature_selection,
+            "imputers": imputers,
+            "score_threshold": score_threshold,
+            "random_state": random_state,
+            "sample_for_search": sample_for_search,
+            "max_search_sample_size": max_search_sample_size,
+            "ensemble_size": ensemble_size,
+            "n_folds_cv": n_folds_cv,
+        }
+
         self.seeker = RegressionEnsembleSeeker(
             self.internal_name,
             num_iter=num_iter,
@@ -291,6 +316,8 @@ class RegressionStudy(Study):
     def run(self) -> Any:
         """Run the study. The call returns the optimal model architecture - not fitted."""
         self._should_continue()
+        self._start_time = time.time()
+        self._search_history = []
 
         best_score, best_model = self._load_progress()
 
@@ -326,10 +353,20 @@ class RegressionStudy(Study):
                 **eval_metrics,
             )
 
+            iter_duration = time.time() - start
+            is_best = False
+
             if score < self.score_threshold:
                 log.info(
                     f"The ensemble is not good enough, keep searching {metrics['str']}"
                 )
+                self._search_history.append({
+                    "iteration": it + 1,
+                    "model_name": current_model.name(),
+                    "score": score,
+                    "duration": iter_duration,
+                    "is_best": False,
+                })
                 continue
 
             if best_score >= score:
@@ -337,6 +374,13 @@ class RegressionStudy(Study):
                     f"Model score not improved {score}. Previous best {best_score}"
                 )
                 patience += 1
+                self._search_history.append({
+                    "iteration": it + 1,
+                    "model_name": current_model.name(),
+                    "score": score,
+                    "duration": iter_duration,
+                    "is_best": False,
+                })
 
                 if patience > PATIENCE:
                     log.info(
@@ -348,26 +392,73 @@ class RegressionStudy(Study):
             patience = 0
             best_score = metrics["raw"][self.metric][0]
             best_model = current_model
+            is_best = True
+
+            self._best_metrics = {m: metrics["str"][m] for m in metrics["str"]}
+            self._best_metrics_raw = {m: metrics["raw"][m] for m in metrics["raw"]}
 
             log.info(
                 f"Best ensemble so far: {best_model.name()} with score {metrics['raw'][self.metric]}"
             )
 
+            self._search_history.append({
+                "iteration": it + 1,
+                "model_name": current_model.name(),
+                "score": score,
+                "duration": iter_duration,
+                "is_best": is_best,
+            })
+
             self._save_progress(best_model)
 
+        self._end_time = time.time()
         self.hooks.finish()
 
         if best_score < self.score_threshold:
             log.warning(
                 f"Unable to find a model above threshold {self.score_threshold}. Returning None"
             )
+            self._best_score = best_score
+            self._best_model_name = None
             return None
 
+        self._best_score = best_score
+        self._best_model_name = best_model.name()
         return best_model
 
     def fit(self) -> Any:
         """Run the study and train the model. The call returns the fitted model."""
         model = self.run()
-        model.fit(self.X, self.Y)
+        if model is not None:
+            model.fit(self.X, self.Y)
 
         return model
+
+    def report(self) -> StudyReport:
+        """Generate a study report. Call after fit() or run().
+
+        Prints a console summary and saves an HTML report to the workspace.
+
+        Returns:
+            StudyReport with all study results and metadata.
+        """
+        success = hasattr(self, "_best_score") and self._best_score >= self.score_threshold
+
+        rpt = StudyReport(
+            study_name=self.study_name,
+            task_type="regression",
+            metric=self.metric,
+            best_score=getattr(self, "_best_score", -1),
+            best_model_name=getattr(self, "_best_model_name", None),
+            best_metrics=self._best_metrics,
+            best_metrics_raw=self._best_metrics_raw,
+            search_history=self._search_history,
+            study_config=self._study_config,
+            workspace=str(self.output_folder),
+            total_duration_seconds=self._end_time - self._start_time if self._end_time else 0,
+            success=success,
+        )
+
+        print(rpt.to_console())
+        rpt.save()
+        return rpt
