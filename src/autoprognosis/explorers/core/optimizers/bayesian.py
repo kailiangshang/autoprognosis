@@ -78,13 +78,29 @@ class ParamRepeatPruner:
 
 
 class BayesianOptimizer:
-    """Optimization helper based on Bayesian Optimization.
+    """Hyperparameter optimizer powered by Optuna's TPE (Tree-structured Parzen Estimator).
+
+    Uses optuna.samplers.TPESampler for Bayesian hyperparameter search with
+    automatic early stopping via ParamRepeatPruner. Supports optional Redis
+    backend for distributed trial storage.
 
     Args:
-        patience: int
-            maximum iterations without any gain
+        study_name: str
+            Unique identifier for the Optuna study.
+        evaluation_cbk: Callable
+            Callback that evaluates a set of hyperparameters and returns a score.
+        estimator: Any
+            The estimator whose hyperparameters are being optimized.
+        ensemble_len: Optional[int]
+            Number of models in ensemble (for ensemble weight optimization).
+        n_trials: int
+            Maximum number of Optuna trials to run.
+        timeout: int
+            Maximum seconds for the optimization loop.
+        skip_recap: bool
+            If True, skip enqueuing initial baseline trials for ensemble optimization.
         random_state: int
-            random seed
+            Random seed for the TPE sampler.
     """
 
     @validate_arguments(config=dict(arbitrary_types_allowed=True))
@@ -116,20 +132,25 @@ class BayesianOptimizer:
         storage_type: str = "redis",
         patience: int = threshold,
     ) -> Tuple[optuna.Study, ParamRepeatPruner]:
-        """Helper for creating a new study.
+        """Create an Optuna study with optional Redis storage backend.
+
+        Attempts to use Redis for distributed trial persistence. Falls back
+        to in-memory storage if Redis is unavailable.
 
         Args:
             study_name: str
-                Study ID
+                Optuna study ID.
             direction: str
-                maximize/minimize
+                "maximize" or "minimize".
             load_if_exists: bool
-                If True, it tries to load previous trials from the storage.
+                If True, resume from previous trials in storage.
             storage_type: str
-                redis/none
+                "redis" to attempt Redis backend, anything else for in-memory.
             patience: int
-                How many trials without improvement to accept.
+                Max consecutive trials without improvement before early stopping.
 
+        Returns:
+            Tuple of (optuna.Study, ParamRepeatPruner).
         """
 
         storage_obj = None
@@ -190,11 +211,17 @@ class BayesianOptimizer:
         except EarlyStoppingExceeded:
             log.info("Early stopping triggered for search")
 
+        completed_trials = study.get_trials(
+            states=[optuna.trial.TrialState.COMPLETE]
+        )
+        log.info(
+            f"Optuna search completed for {self.estimator.name()}: "
+            f"{len(completed_trials)} trials, best={study.best_value:.4f}"
+        )
+
         scores = [baseline_score]
         params = [{}]
-        for trial_idx, trial_past in enumerate(
-            study.get_trials(states=[optuna.trial.TrialState.COMPLETE])
-        ):
+        for trial_idx, trial_past in enumerate(completed_trials):
             scores.append(trial_past.values[0])
             params.append(trial_past.params)
 
@@ -240,6 +267,12 @@ class BayesianOptimizer:
             for trial in initial_trials:
                 study.enqueue_trial(trial)
 
+        try:
+            study.optimize(objective, n_trials=self.n_trials, timeout=self.timeout)
+        except EarlyStoppingExceeded:
+            log.info("Early stopping triggered for search")
+
+        return study.best_value, study.best_trial.params
         try:
             study.optimize(objective, n_trials=self.n_trials, timeout=self.timeout)
         except EarlyStoppingExceeded:
